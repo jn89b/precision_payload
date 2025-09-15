@@ -1,0 +1,6 @@
+[submodule "AircraftSim"]
+	path = AircraftSim
+	url = https://github.com/jn89b/AircraftSim.git
+[submodule "OptiTraj"]
+	path = OptiTraj
+	url = https://github.com/jn89b/OptiTraj.git
