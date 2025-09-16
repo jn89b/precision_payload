@@ -262,21 +262,40 @@ class Config:
     process_sigma_mps: float = 0.2             # random-walk per bin (smoothness)
 
     # --- Parafoil / mission ---
-    target_NE: Tuple[float,float] = (0.0, 0.0) # internal (N,E)
-    z_release: float = 3000.0                  # m AGL
+    target_NE: Tuple[float,float] = (0.0, 0.0)
+    z_release: float = 2000.0
     z_ground: float = 1500.0
     dt: float = 0.2
-    Va_forward: float = 9.0                    # parafoil fwd airspeed
-    V_sink: float = 2.5                        # parafoil sink rate
-    psi_dot_max: float = math.radians(15.0)    # max heading rate
-    L1_dist: float = 60.0
-    loiter_ring_R_m: float = 250.0             # for CARP search
 
+    # Air/parafoil model (physics)  # NEW
+    # Glide-ratio model (constant GR)
+    glide_ratio: float = 0.4          # level-flight GR = Va / Vsink  (e.g., 4:1)
+    bank_sink_exponent: float = 1.0   # α in (1/cos(phi))^α; 0 = no extra sink in turns
+    phi_max_deg: float = 35.0         # bank angle limit for turns
+    Va_trim_mps: float = 9.0          # trimmed airspeed magnitude
+    bank_kp: float = 2.0              # bank cmd [rad] per rad of heading error
+    
+    # Turn/controls  # NEW
+    bank_kp: float = 2.0               # bank angle command [rad] per rad of heading error    # NEW
+    phi_max_deg: float = 35.0          # bank angle hard limit                                # NEW
+
+    # (DEPRECATE these two if you like; they’re unused in physics model)
+    Va_forward: float = 9.0            # (legacy) parafoil fwd airspeed
+    V_sink: float = 2.5                # (legacy) constant sink
+
+    psi_dot_max: float = math.radians(15.0)
+    L1_dist: float = 60.0
+    loiter_ring_R_m: float = 150.0
+    
     # --- Monte Carlo ---
     N_mc: int = 100
     turb_sigma_mps: float = 0.25               # per-step white noise gust during descent
     ellipse_nsig: float = 2.0                  # ~95% for Gaussian
     box_margin_m: float = 10.0
+    start_position_noise_m: float = 40.0               # simulate GPS noise on release point
+    position_noise_m: float = 5.0               # simulate GPS noise on landing point
+    velocity_noise_mps: float = 0.4            # simulate GPS noise on landing point
+    heading_noise_deg: float = 5.0           # simulate compass noise on landing point  
 
     # --- Output dir ---
     out_dir: str = "/mnt/data"
@@ -411,84 +430,6 @@ class FuseCfg:
     dz: float = 25.0
     process_sigma: float = 0.2     # m/s per altitude-bin step
 
-def fuse_prior_with_pins(prior: Prior, pins: List[Dict], cfg: FuseCfg):
-    z_grid = np.arange(cfg.z_min, cfg.z_max + 1e-6, cfg.dz)
-
-    mN = np.array([prior.wind(z)[0] for z in z_grid])
-    mE = np.array([prior.wind(z)[1] for z in z_grid])
-    sN = np.array([prior.std(z)[0]  for z in z_grid])
-    sE = np.array([prior.std(z)[1]  for z in z_grid])
-    Pn = (sN**2).copy()
-    Pe = (sE**2).copy()
-    Q  = cfg.process_sigma**2
-
-    pins = sorted(pins, key=lambda d: d["z"])
-
-    for pin in pins:
-        zi, wN_i, wE_i, R = pin["z"], pin["wN"], pin["wE"], pin["R"]
-        # Interpolate pin to nearest two bins
-        if zi <= z_grid[0]:
-            idxs, wts = [0], [1.0]
-        elif zi >= z_grid[-1]:
-            idxs, wts = [len(z_grid)-1], [1.0]
-        else:
-            j = int((zi - z_grid[0])//cfg.dz)
-            z0, z1 = z_grid[j], z_grid[j+1]
-            t = (zi - z0)/(z1 - z0 + 1e-9)
-            idxs, wts = [j, j+1], [1-t, t]
-
-        for idx, wt in zip(idxs, wts):
-            if wt < 1e-6: continue
-            # # predict
-            # Pn[idx] += Q; Pe[idx] += Q
-            # # measurement variance per component (split by weight)
-            # Rn = float(R[0,0]) / (wt**2 + 1e-12)
-            # Re = float(R[1,1]) / (wt**2 + 1e-12)
-            # # Kalman update (scalar per component)
-            # Kn = Pn[idx] / (Pn[idx] + Rn + 1e-12)
-            # Ke = Pe[idx] / (Pe[idx] + Re + 1e-12)
-            # mN[idx] = mN[idx] + Kn*(wN_i - mN[idx])
-            # mE[idx] = mE[idx] + Ke*(wE_i - mE[idx])
-            # Pn[idx] = (1 - Kn)*Pn[idx]
-            # Pe[idx] = (1 - Ke)*Pe[idx]
-            
-            # predict
-            Pn[idx] += Q
-            Pe[idx] += Q
-
-            # correct (N)
-            H = wt
-            Rn = float(R[0,0])
-            Sn = H*Pn[idx]*H + Rn + 1e-12
-            Kn = (Pn[idx]*H) / Sn
-            innov_n = wN_i - H*mN[idx]
-            mN[idx] += Kn * innov_n
-            Pn[idx] = (1.0 - Kn*H) * Pn[idx]
-
-            # correct (E)
-            Re = float(R[1,1])
-            Se = H*Pe[idx]*H + Re + 1e-12
-            Ke = (Pe[idx]*H) / Se
-            innov_e = wE_i - H*mE[idx]
-            mE[idx] += Ke * innov_e
-            Pe[idx] = (1.0 - Ke*H) * Pe[idx]
-
-    # optional gentle smoothing across neighboring bins
-    for _ in range(2):
-        mN = 0.25*np.roll(mN,1) + 0.5*mN + 0.25*np.roll(mN,-1)
-        mE = 0.25*np.roll(mE,1) + 0.5*mE + 0.25*np.roll(mE,-1)
-
-    fN, kindN = _make_interp(z_grid, mN)
-    fE, kindE = _make_interp(z_grid, mE)
-    fSN, _ = _make_interp(z_grid, np.sqrt(Pn))
-    fSE, _ = _make_interp(z_grid, np.sqrt(Pe))
-
-    def updated_wind(z: float): return float(fN(z)), float(fE(z))
-    def updated_std(z: float):  return float(fSN(z)), float(fSE(z))
-
-    dbg = dict(z_grid=z_grid, mN=mN, mE=mE, Pn=Pn, Pe=Pe, kind=kindN if kindN==kindE else "mixed")
-    return updated_wind, updated_std, dbg
-
 # =========================
 # 4) Parafoil guidance + CARP (internals N,E; plots in E=x, N=y)
 # =========================
@@ -501,37 +442,90 @@ def crab_heading_for_track(chi_d: float, wN: float, wE: float, Va: float):
     Vg = Va*math.cos(delta) + W_along
     return psi_cmd, Vg
 
-def rate_limit(cur: float, des: float, max_rate: float, dt: float):
-    err = (des - cur + np.pi)%(2*np.pi) - np.pi
-    return cur + np.clip(err, -max_rate*dt, max_rate*dt)
+
+def _sink_from_gr(Va: float, phi: float, GR: float, alpha: float) -> float:
+    """
+    Constant-GR sink model with optional bank penalty.
+    Vsink(phi) = (Va / GR) * (1/cos(phi))**alpha
+    """
+    phi = float(np.clip(phi, -np.pi/2 + 1e-3, np.pi/2 - 1e-3))
+    base = Va / max(1e-6, GR)
+    bank_factor = (1.0 / math.cos(phi)) ** float(alpha)
+    return base * bank_factor
 
 def simulate_parafoil_drop(release_NE, wind_func, turb_sigma=0.0):
+    """
+    Parafoil with config-defined glide ratio:
+    - Airspeed magnitude = CFG.Va_trim_mps
+    - Sink rate Vsink = Va/GR, optionally increased in turns by (1/cos(phi))^alpha
+    - Bank command from heading error (P-control), limited to phi_max_deg
+    - Heading rate from coordinated-turn kinematics
+    """
     pN, pE = float(release_NE[0]), float(release_NE[1])
-    z = CFG.z_release; psi = 0.0
+    z = CFG.z_release
+    psi = 0.0
     tgtN, tgtE = CFG.target_NE
+
+    Va = CFG.Va_trim_mps
+    phi_max = math.radians(CFG.phi_max_deg)
+    x_start_noise = np.random.uniform(-CFG.start_position_noise_m, CFG.start_position_noise_m)
+    y_start_noise = np.random.uniform(-CFG.start_position_noise_m, CFG.start_position_noise_m)
+    pN += y_start_noise
+    pE += x_start_noise
+    
     Xs, Ys = [pE], [pN]  # x=E, y=N
+
     while z > CFG.z_ground:
+        # L1 point
         vN, vE = (tgtN - pN), (tgtE - pE)
         dist = max(math.hypot(vN, vE), 1e-6)
         if dist > CFG.L1_dist:
-            laN = pN + (CFG.L1_dist/dist)*vN
-            laE = pE + (CFG.L1_dist/dist)*vE
+            laN = pN + (CFG.L1_dist/dist) * vN
+            laE = pE + (CFG.L1_dist/dist) * vE
         else:
             laN, laE = tgtN, tgtE
         chi_d = math.atan2(laE - pE, laN - pN)
+
+        # Wind (with optional gust)
         wN, wE = wind_func(z)
         if turb_sigma > 0.0:
-            wN += np.random.randn()*turb_sigma
-            wE += np.random.randn()*turb_sigma
-        psi_cmd, _ = crab_heading_for_track(chi_d, wN, wE, CFG.Va_forward)
-        psi = rate_limit(psi, psi_cmd, CFG.psi_dot_max, CFG.dt)
-        v_aN = CFG.Va_forward*math.cos(psi)
-        v_aE = CFG.Va_forward*math.sin(psi)
-        gN = v_aN + wN; gE = v_aE + wE
-        pN += gN*CFG.dt; pE += gE*CFG.dt; z -= CFG.V_sink*CFG.dt
+            wN += np.random.randn() * turb_sigma
+            wE += np.random.randn() * turb_sigma
+
+        # Desired air heading to track desired ground course
+        psi_cmd, _ = crab_heading_for_track(chi_d, wN, wE, Va)
+
+        # Bank command from heading error, saturate
+        err = (psi_cmd - psi + np.pi) % (2*np.pi) - np.pi
+        phi_cmd = np.clip(CFG.bank_kp * err, -phi_max, +phi_max)
+
+        # Coordinated-turn heading dynamics
+        psi_dot = (9.80665 * math.tan(phi_cmd)) / max(1e-3, Va)
+        psi += psi_dot * CFG.dt
+
+        # Air-relative velocity
+        air_velocity_noise = CFG.velocity_noise_mps 
+        vel_random_noise: float = np.random.uniform(-air_velocity_noise, air_velocity_noise)
+        v_aN = Va * math.cos(psi)  + vel_random_noise
+        v_aE = Va * math.sin(psi) + vel_random_noise
+
+        # Ground velocity
+        gN = v_aN + wN + np.random.uniform(-air_velocity_noise, air_velocity_noise)
+        gE = v_aE + wE + np.random.uniform(-air_velocity_noise, air_velocity_noise)
+
+        # Sink from config-defined GR (+ bank penalty)
+        Vsink = _sink_from_gr(Va, phi_cmd, CFG.glide_ratio, CFG.bank_sink_exponent)
+
+        # Integrate
+        pN += gN * CFG.dt
+        pE += gE * CFG.dt
+        z  -= Vsink * CFG.dt
+
         Xs.append(pE); Ys.append(pN)
+
     miss = math.hypot(pN - tgtN, pE - tgtE)
     return np.array(Xs), np.array(Ys), miss
+
 
 def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
     R = CFG.loiter_ring_R_m
@@ -545,93 +539,6 @@ def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
         if miss < best_d:
             best_d, best_NE = miss, np.array([relN, relE])
     return best_NE, best_d
-
-
-# =========================
-# Pins-only vertical model
-# =========================
-@dataclass
-class PinsOnlyCfg:
-    mode: str = "linear"      # "nearest" or "linear"
-    sigma_floor: float = 0.6  # m/s
-    clamp_margin_m: float = 50.0  # how far outside pins we still allow linear
-    ridge: float = 0.0        # small L2 to discourage big slopes (e.g., 1e-6)
-
-def _wls_linear_fit_centered(zc: np.ndarray, y: np.ndarray, s: np.ndarray, ridge: float = 0.0):
-    """
-    Weighted least squares of y ~ a + b*zc (zc is ALREADY centered).
-    """
-    w = 1.0 / (np.maximum(s, 1e-6) ** 2)
-    A = np.vstack([np.ones_like(zc), zc]).T
-    # (A^T W A + λI) β = A^T W y
-    W = np.diag(w)
-    ATA = A.T @ W @ A + ridge * np.eye(2)
-    ATy = A.T @ W @ y
-    beta = np.linalg.solve(ATA, ATy)
-    a, b = float(beta[0]), float(beta[1])
-    r = y - (a + b*zc)
-    dof = max(1, len(zc) - 2)
-    sigma2 = float((w * r**2).sum() / dof)
-    cov_beta = sigma2 * np.linalg.inv(ATA)
-    return a, b, cov_beta, sigma2
-
-def model_from_pins(pins: List[Dict], cfg: PinsOnlyCfg):
-    z_i  = np.array([p["z"]  for p in pins], float)
-    wN_i = np.array([p["wN"] for p in pins], float)
-    wE_i = np.array([p["wE"] for p in pins], float)
-    sN_i = np.array([math.sqrt(max(1e-12, p["R"][0,0])) for p in pins], float)
-    sE_i = np.array([math.sqrt(max(1e-12, p["R"][1,1])) for p in pins], float)
-
-    z0 = float(np.mean(z_i))  # center for numerical stability
-    zc = z_i - z0
-
-    if cfg.mode == "nearest" or len(pins) < 2:
-        def wind(zq: float):
-            k = int(np.argmin(np.abs(z_i - zq)))
-            return float(wN_i[k]), float(wE_i[k])
-        def std(zq: float):
-            k = int(np.argmin(np.abs(z_i - zq)))
-            return float(max(cfg.sigma_floor, sN_i[k])), float(max(cfg.sigma_floor, sE_i[k]))
-        return wind, std, dict(mode="nearest", z=z_i, z0=z0)
-
-    # weighted linear fits in centered z
-    aN, bN, covN, _ = _wls_linear_fit_centered(zc, wN_i, sN_i, ridge=cfg.ridge)
-    aE, bE, covE, _ = _wls_linear_fit_centered(zc, wE_i, sE_i, ridge=cfg.ridge)
-
-    z_lo, z_hi = float(z_i.min()), float(z_i.max())
-    z_lo_lin = z_lo - cfg.clamp_margin_m
-    z_hi_lin = z_hi + cfg.clamp_margin_m
-
-    def _pred(a, b, cov, zq):
-        # clamp/blend outside the linear validity band
-        if zq < z_lo_lin:
-            k = int(np.argmin(np.abs(z_i - zq)))
-            mu = float(wN_i[k] if cov is covN else wE_i[k])
-            s  = math.sqrt(max(cfg.sigma_floor**2, (sN_i[k] if cov is covN else sE_i[k])**2))
-            return mu, s
-        if zq > z_hi_lin:
-            k = int(np.argmin(np.abs(z_i - zq)))
-            mu = float(wN_i[k] if cov is covN else wE_i[k])
-            s  = math.sqrt(max(cfg.sigma_floor**2, (sN_i[k] if cov is covN else sE_i[k])**2))
-            return mu, s
-        zc_q = zq - z0
-        mu = a + b*zc_q
-        v  = np.array([1.0, zc_q]) @ cov @ np.array([1.0, zc_q])
-        s  = math.sqrt(max(0.0, v))
-        return float(mu), float(max(cfg.sigma_floor, s))
-
-    def wind(zq: float):
-        muN, _ = _pred(aN, bN, covN, zq)
-        muE, _ = _pred(aE, bE, covE, zq)
-        return muN, muE
-
-    def std(zq: float):
-        _, sN = _pred(aN, bN, covN, zq)
-        _, sE = _pred(aE, bE, covE, zq)
-        return sN, sE
-
-    return wind, std, dict(mode="linear_centered", z0=z0, aN=aN, bN=bN, aE=aE, bE=bE,
-                           z_span=(z_lo, z_hi))
 
 
 # =========================
@@ -651,7 +558,7 @@ def main():
         # Sim rings: by default, around release altitude ±200 m
         if CFG.sim_loiter_alts_m is None:
             # CFG.sim_loiter_alts_m = [CFG.z_release - 200, CFG.z_release, CFG.z_release + 200]
-            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 500, CFG.z_release + 401, 50).tolist()
+            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 200, CFG.z_release + 401, 50).tolist()
         pins = simulate_loiter_pins(
             alts=CFG.sim_loiter_alts_m,
             Va=CFG.sim_loiter_Va_mps,
@@ -787,43 +694,23 @@ def main():
     for a in axs:
         a.grid(True); a.legend()
         
-
     #create a 3d plot
-    fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize=(10, 8))
-    ax.plot3D(X_det, Y_det, np.linspace(CFG.z_release, CFG.z_ground, len(X_det)), 'gray', label='Deterministic Path')
-    ax.scatter(impacts[:,0], impacts[:,1], np.full(len(impacts), CFG.z_ground), c='r', s=10, alpha=0.5, label='Impact Points')
-    ax.set_xlabel('East [m]')
-    ax.set_ylabel('North [m]')
-    ax.set_zlabel('Altitude [m]')
-    ax.set_title('3D Parafoil Drop Simulation')
-    ax.legend()
+    # fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize=(10, 8))
+    # ax.plot3D(X_det, Y_det, np.linspace(CFG.z_release, CFG.z_ground, len(X_det)), 'gray', label='Deterministic Path')
+    # ax.scatter(impacts[:,0], impacts[:,1], np.full(len(impacts), CFG.z_ground), c='r', s=10, alpha=0.5, label='Impact Points')
+    # ax.set_xlabel('East [m]')
+    # ax.set_ylabel('North [m]')
+    # ax.set_zlabel('Altitude [m]')
+    # ax.set_title('3D Parafoil Drop Simulation')
+    # ax.legend()
 
     plt.tight_layout()
     fig_path = os.path.join(CFG.out_dir, "wind_pipeline_results.png")
     plt.savefig(fig_path, dpi=150)
 
-    # Save updated profile on dz grid
-    # z_grid = fdbg["z_grid"]
-    # up_wN  = np.array([updated_wind(z)[0] for z in z_grid])
-    # up_wE  = np.array([updated_wind(z)[1] for z in z_grid])
-    # up_sN  = np.array([updated_std(z)[0]  for z in z_grid])
-    # up_sE  = np.array([updated_std(z)[1]  for z in z_grid])
-    # prof_csv = os.path.join(CFG.out_dir, "updated_wind_profile.csv")
-    # pd.DataFrame(dict(altitude_m=z_grid, wN_mps=up_wN, wE_mps=up_wE,
-    #                   sigN_mps=up_sN, sigE_mps=up_sE)).to_csv(prof_csv, index=False)
-
-#     # Save region box
-#     summary_txt = f"""Updated layer at z_release={CFG.z_release:.1f} m: wN={wN_layer:.2f} m/s, wE={wE_layer:.2f} m/s
-# Deterministic miss with full updated profile: {miss_det:.2f} m
-# Region box (x=E, y=N): xmin={xmin:.1f}, ymin={ymin:.1f}, xmax={xmax:.1f}, ymax={ymax:.1f}
-# """
-#     with open(os.path.join(CFG.out_dir, "pipeline_summary.txt"), "w") as f:
-#         f.write(summary_txt)
-
-#     print(f"Saved figure: {fig_path}")
-#     print(f"Saved updated profile: {prof_csv}")
-#     print(summary_txt)
-#     plt.show()
-
 if __name__ == "__main__":
-    main()
+    plt.close('all')
+    for i in range(10):
+        # randomize seed for each run
+        np.random.seed()
+        main()
