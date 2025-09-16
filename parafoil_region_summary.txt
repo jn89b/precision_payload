@@ -1,0 +1,17 @@
+
+CARP (coarse search on loiter ring):
+  release_xy = (26.13, -248.63) m; deterministic miss with true profile = 134.07 m
+
+Wind estimate at release layer (from loiter):
+  w_hat = (0.34 N, 9.01 E) m/s
+  true  = (0.31, 9.00) m/s
+
+Dispersion (N=800) summary:
+  Mean impact  = (34.94, 65.20) m
+  Covariance   = [[1067.52, 1023.58],
+                  [1023.58, 2519.18]]
+  Ellipse nsig = 2.0 (width=220.8 m, height=92.8 m, angle=62.7 deg)
+
+A* region (axis-aligned box around ellipse + margin 10.0 m):
+  xmin=-40.4, ymin=-45.2, xmax=110.3, ymax=175.6
+  width=150.7 m, height=220.8 m
