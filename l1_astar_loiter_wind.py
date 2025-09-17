@@ -11,7 +11,7 @@
 import os, math, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from typing import Tuple, Callable, List, Dict
+from typing import Tuple, Callable, List, Dict, Optional
 
 try:
     from scipy.interpolate import PchipInterpolator
@@ -269,7 +269,7 @@ class Config:
 
     # Air/parafoil model (physics)  # NEW
     # Glide-ratio model (constant GR)
-    glide_ratio: float = 0.4          # level-flight GR = Va / Vsink  (e.g., 4:1)
+    glide_ratio: float = 0.2          # level-flight GR = Va / Vsink  (e.g., 4:1)
     bank_sink_exponent: float = 1.0   # α in (1/cos(phi))^α; 0 = no extra sink in turns
     phi_max_deg: float = 35.0         # bank angle limit for turns
     Va_trim_mps: float = 9.0          # trimmed airspeed magnitude
@@ -300,11 +300,50 @@ class Config:
     # --- Output dir ---
     out_dir: str = "/mnt/data"
 
-CFG = Config()
 
 # =========================
 # Utilities
 # =========================
+def find_desired_csvs(root_dir: str, key_name:str) -> List[str]:
+    """
+    Crawl through a directory recursively and return a list of CSV file paths 
+    containing 'desc' in their filename.
+
+    Args:
+        root_dir (str): The root directory to start the search from.
+
+    Returns:
+        List[str]: A list of file paths that match the criteria.
+    """
+    matches = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.lower().endswith(".csv") and key_name in filename.lower():
+                matches.append(os.path.join(dirpath, filename))
+    return matches
+
+def open_csv_by_index(csv_files:List[str], index: int) -> Optional[pd.DataFrame]:
+    """
+    Open the CSV at the selected index from the list of matching CSVs.
+
+    Args:
+        root_dir (str): The directory to search.
+        index (int): The index of the CSV file to open.
+
+    Returns:
+        pd.DataFrame | None: The DataFrame if found, otherwise None.
+    """
+    if not csv_files:
+        print("No CSVs with 'desc' found.")
+        return None
+    if index < 0 or index >= len(csv_files):
+        print(f"Invalid index. Choose between 0 and {len(csv_files)-1}")
+        return None
+
+    file_path = csv_files[index]
+    print(f"Opening [{index}]: {file_path}")
+    return pd.read_csv(file_path)
+
 def _make_interp(z: np.ndarray, y: np.ndarray):
     """Return an interpolator f(z) with PCHIP if available, else linear clamp."""
     z = np.asarray(z, float); y = np.asarray(y, float)
@@ -710,7 +749,14 @@ def main():
 
 if __name__ == "__main__":
     plt.close('all')
-    for i in range(10):
+    csvs: List[str] = find_desired_csvs("Balloon Wind Files", "desc")
+    print(f"Found {len(csvs)} candidate prior CSVs:")
+    CFG = Config()
+
+    CFG.prior_csv_path = csvs[1] if csvs else CFG.prior_csv_path
+    print(f"Using prior CSV: {CFG.prior_csv_path}")
+    #csv_file = open_csv_by_index(csvs, 0)  # change index to select different file
+    for i in range(5):
         # randomize seed for each run
         np.random.seed()
         main()
