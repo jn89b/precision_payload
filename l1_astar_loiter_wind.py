@@ -28,6 +28,9 @@ except Exception:
     HAS_SKLEARN = False
 
 
+GROUND_TRUTH_COLOR: str = 'black'  # color for ground truth wind profile in plots
+GROUND_TRUTH_ALPHA : float = 0.5  # alpha for ground truth wind profile in plots
+
 @dataclass
 class PinsSmoothCfg:
     z_min: float
@@ -247,29 +250,44 @@ class Config:
     # time, vgN, vgE, Va, psi_rad, z, ring_id   (psi in radians; speeds m/s; altitude m AGL)
     loiter_samples_csv: str | None = None      # e.g., "/mnt/data/loiter_logs.csv"
 
+    # --- Prior source ---
+    prior_mode: str = "csv"            # "csv" | "random" | "none"
+    random_seed: Optional[int] = 1234  # None → truly random each run
+
+    # --- Random prior (mean profile) params ---
+    rand_base_mps: Tuple[float, float] = (2.0, -1.5)   # (wN0, wE0) at z_min
+    rand_shear_mps_per_km: Tuple[float, float] = (3.0, -2.0)  # linear shear per km
+    rand_veer_deg_per_km: float = 10.0                 # clockwise veer with altitude
+    rand_sine_amp_mps: float = 1.0                     # gentle waviness vs z
+    rand_sine_period_m: float = 1200.0
+
+    # --- Gusts used during loiter (colored) ---
+    gust_sigma_mps: float = 2.0         # RMS of gust component per axis
+    gust_tau_s: float = 3.0             # time constant of Gauss-Markov (Dryden-like)
+
     # --- Loiter simulation (used only if loiter_samples_csv is None) ---
     sim_loiter_alts_m: List[float] = None      # if None, auto around release altitude
     sim_loiter_radius_m: float = 250.0
     sim_loiter_Va_mps: float = 22.0
     sim_samples_per_circle: int = 240
-    sim_meas_noise_mps: float = 0.4            # noise on vg components
+    sim_meas_noise_mps: float = 0.5            # noise on vg components
 
     # --- Fusion grid ---
-    z_min: float = 1500.0
-    z_max: float = 6000.0
+    z_min: float = 1600.0
+    z_max: float = 2500.0
     dz: float = 20.0
-    prior_sigma_floor_mps: float = 1.0         # conservative prior std per component
+    prior_sigma_floor_mps: float = 2.0         # conservative prior std per component
     process_sigma_mps: float = 0.2             # random-walk per bin (smoothness)
 
     # --- Parafoil / mission ---
     target_NE: Tuple[float,float] = (0.0, 0.0)
-    z_release: float = 2000.0
     z_ground: float = 1500.0
+    z_release: float = 2000.0
     dt: float = 0.2
 
     # Air/parafoil model (physics)  # NEW
     # Glide-ratio model (constant GR)
-    glide_ratio: float = 0.2          # level-flight GR = Va / Vsink  (e.g., 4:1)
+    glide_ratio: float = 0.3         # level-flight GR = Va / Vsink  (e.g., 4:1)
     bank_sink_exponent: float = 1.0   # α in (1/cos(phi))^α; 0 = no extra sink in turns
     phi_max_deg: float = 35.0         # bank angle limit for turns
     Va_trim_mps: float = 9.0          # trimmed airspeed magnitude
@@ -278,10 +296,6 @@ class Config:
     # Turn/controls  # NEW
     bank_kp: float = 2.0               # bank angle command [rad] per rad of heading error    # NEW
     phi_max_deg: float = 35.0          # bank angle hard limit                                # NEW
-
-    # (DEPRECATE these two if you like; they’re unused in physics model)
-    Va_forward: float = 9.0            # (legacy) parafoil fwd airspeed
-    V_sink: float = 2.5                # (legacy) constant sink
 
     psi_dot_max: float = math.radians(15.0)
     L1_dist: float = 60.0
@@ -296,10 +310,11 @@ class Config:
     position_noise_m: float = 5.0               # simulate GPS noise on landing point
     velocity_noise_mps: float = 0.4            # simulate GPS noise on landing point
     heading_noise_deg: float = 5.0           # simulate compass noise on landing point  
+    completely_different: bool = False      # if True, each loiter ring has completely different mean wind (for testing)
+    
 
     # --- Output dir ---
     out_dir: str = "/mnt/data"
-
 
 # =========================
 # Utilities
@@ -369,6 +384,7 @@ def _blend_to_prior(mu_gp: np.ndarray, mu_prior: np.ndarray,
 # =========================
 # 1) PRIOR from CSV
 # =========================
+
 @dataclass
 class Prior:
     wind: Callable[[float], Tuple[float,float]]
@@ -407,6 +423,116 @@ def build_prior_from_csv(csv_path: str, sigma_floor: float = 1.0) -> Prior:
 
     return Prior(prior_wind, prior_std, z, wN, wE, sigN, sigE, kindN if kindN==kindE else "mixed")
 
+# ---- Ground truth profile (for demos / robustness) ----
+@dataclass
+class Truth:
+    wind: Callable[[float], Tuple[float, float]]
+
+def build_truth_from_prior(
+    prior: Prior,
+    mode: str = "biased_shear",
+    scaleN: float = 1.5,   # m/s amplitude for N bias "bump"
+    scaleE: float = -0.8,  # m/s offset for E bias
+    shearE: float = 0.002  # (m/s) per meter shear in E
+) -> Truth:
+    """
+    Make a synthetic 'truth' that differs from the prior (to show robustness).
+    mode options: 'biased_shear' (default), 'prior' (no change).
+    """
+    if mode == "prior":
+        return Truth(wind=lambda z: prior.wind(z))
+
+    # Example: add a Gaussian bump to wN near 2200 m; add offset + mild shear to wE
+    def truth_wind(z: float):
+        wN0, wE0 = prior.wind(z)
+        bumpN = scaleN * np.exp(-0.5 * ((z - 2200.0) / 300.0) ** 2)
+        biasE = scaleE + shearE * (z - 2000.0)
+        return (wN0 + bumpN, wE0 + biasE)
+
+    return Truth(wind=truth_wind)
+
+def _rotz(theta: float) -> np.ndarray:
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]], float)
+
+def build_prior_random(z_min: float, z_max: float, dz: float, cfg: Config) -> Prior:
+    """
+    Synthetic vertical profile with linear shear, veer, and small sinusoidal variation.
+    Produces a Prior(wind,std,...) compatible with the CSV-based one.
+    """
+    rng = np.random.default_rng(cfg.random_seed)
+    z = np.arange(z_min, z_max + 1e-9, dz, dtype=float)
+
+    # Base vector at z_min
+    w0 = np.array(cfg.rand_base_mps, float)  # [wN, wE]
+
+    # Linear shear per km (convert to per meter)
+    shear = np.array(cfg.rand_shear_mps_per_km, float) / 1000.0  # m/s per m
+
+    # Veer (clockwise) per km
+    veer_per_m = np.deg2rad(cfg.rand_veer_deg_per_km) / 1000.0
+
+    # Gentle sinusoidal structure vs altitude
+    amp = float(cfg.rand_sine_amp_mps)
+    per = max(50.0, float(cfg.rand_sine_period_m))
+
+    wN_list, wE_list = [], []
+    for zz in z:
+        dzm = zz - z[0]
+        # Linear shear
+        w_lin = w0 + shear * dzm
+        # Veer rotation with altitude
+        theta = veer_per_m * dzm
+        w_lin = _rotz(theta) @ w_lin
+        # Add mild periodic structure
+        wobble = amp * np.sin(2*np.pi * dzm / per)
+        # small random bias between N/E to avoid symmetry
+        bias = rng.normal(scale=0.2, size=2)
+        w_vec = w_lin + np.array([wobble, 0.5*wobble]) + bias
+        wN_list.append(w_vec[0]); wE_list.append(w_vec[1])
+
+    wN = np.asarray(wN_list, float)
+    wE = np.asarray(wE_list, float)
+
+    # Conservative std floors (slightly altitude-varying to mimic uncertainty)
+    sigN = np.full_like(wN, 1.0, dtype=float)
+    sigE = np.full_like(wE, 1.0, dtype=float)
+
+    fN, _  = _make_interp(z, wN)
+    fE, _  = _make_interp(z, wE)
+    fSN, _ = _make_interp(z, sigN)
+    fSE, _ = _make_interp(z, sigE)
+
+    def prior_wind(zz: float): return float(fN(zz)), float(fE(zz))
+    def prior_std(zz: float):  return float(fSN(zz)), float(fSE(zz))
+
+    return Prior(prior_wind, prior_std, z, wN, wE, sigN, sigE, kind="synthetic")
+
+def make_gust_generator(sigma_mps: float, tau_s: float, dt_s: float, seed: Optional[int]) -> Callable[[int], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Returns a function g(k) that yields (gN[k], gE[k]) colored gusts where each axis follows
+    x[k] = a*x[k-1] + b*eta, eta~N(0,1); a = exp(-dt/tau), b chosen for stationary variance sigma^2.
+    """
+    if sigma_mps <= 0.0 or tau_s <= 1e-3:
+        def g(_k): return np.zeros(1), np.zeros(1)
+        return g
+
+    rng = np.random.default_rng(seed)
+    a = np.exp(-dt_s / tau_s)
+    b = sigma_mps * np.sqrt(1.0 - a*a)
+
+    gN = 0.0
+    gE = 0.0
+
+    def g(k: int) -> Tuple[np.ndarray, np.ndarray]:
+        nonlocal gN, gE
+        # produce one step (scalar) but return as ndarray for broadcasting
+        gN = a*gN + b*rng.normal()
+        gE = a*gE + b*rng.normal()
+        return np.array([gN]), np.array([gE])
+
+    return g
+
 # =========================
 # 2) Loiter → pins
 # =========================
@@ -439,24 +565,87 @@ def load_loiter_pins_from_csv(csv_path: str) -> List[Dict]:
         ))
     return pins
 
+# def simulate_loiter_ring(alt_m: float, Va_mps: float, R_m: float, samples: int,
+#                          true_wind: Callable[[float],Tuple[float,float]], noise_mps: float=0.4) -> Dict:
+#     thetas = np.linspace(0, 2*np.pi, samples, endpoint=False)  # heading ~ track
+#     psi = thetas.copy()
+#     wN, wE = true_wind(alt_m)
+#     vgN_true = Va_mps*np.cos(psi) + wN
+#     vgE_true = Va_mps*np.sin(psi) + wE
+#     vgN = vgN_true + np.random.randn(samples)*noise_mps
+#     vgE = vgE_true + np.random.randn(samples)*noise_mps
+#     Va = np.full(samples, Va_mps)
+#     z  = np.full(samples, alt_m)
+#     return estimate_wind_pin_from_ring(vgN, vgE, Va, psi, z)
+
 def simulate_loiter_ring(alt_m: float, Va_mps: float, R_m: float, samples: int,
-                         true_wind: Callable[[float],Tuple[float,float]], noise_mps: float=0.4) -> Dict:
+                         true_wind: Callable[[float],Tuple[float,float]],
+                         noise_mps: float = 0.4,
+                         gust_sigma_mps: float = 0.0,
+                         gust_tau_s: float = 3.0,
+                         rng_seed: Optional[int] = None,
+                         completely_different:bool = False) -> Dict:
+    """
+    Simulate a circular loiter and estimate one wind 'pin' at this altitude.
+    Adds colored gusts atop the mean wind so your GP sees realistic variability.
+    """
+    # Geometry and "time step" per sample
     thetas = np.linspace(0, 2*np.pi, samples, endpoint=False)  # heading ~ track
     psi = thetas.copy()
-    wN, wE = true_wind(alt_m)
-    vgN_true = Va_mps*np.cos(psi) + wN
-    vgE_true = Va_mps*np.sin(psi) + wE
-    vgN = vgN_true + np.random.randn(samples)*noise_mps
-    vgE = vgE_true + np.random.randn(samples)*noise_mps
-    Va = np.full(samples, Va_mps)
-    z  = np.full(samples, alt_m)
-    return estimate_wind_pin_from_ring(vgN, vgE, Va, psi, z)
+
+    # Approximate ring period to define dt per sample
+    # Groundspeed magnitude ~ Va relative to air; period ~ circumference / Va
+    T_ring = max(1e-3, (2*np.pi*R_m) / max(1e-3, Va_mps))
+    dt = T_ring / max(1, samples)
+
+    # Gust generator (Gauss–Markov) for both axes, step per sample
+    gust_gen = make_gust_generator(gust_sigma_mps, gust_tau_s, dt, rng_seed)
+
+    # Mean (background) wind at this altitude
+    wN_mean, wE_mean = true_wind(alt_m)
+    if completely_different:
+        # for testing: make this ring's mean wind completely different from true_wind
+        rng = np.random.default_rng(rng_seed)
+        wN_mean += rng.normal(scale=3.0)
+        wE_mean += rng.normal(scale=3.0)
+        print(f"Simulating ring at {alt_m:.1f} m with mean wind (wN,wE)=({wN_mean:.2f},{wE_mean:.2f}) m/s")
+
+    # Build time series
+    vgN = np.zeros(samples, float)
+    vgE = np.zeros(samples, float)
+    Va  = np.full(samples, Va_mps, float)
+    z   = np.full(samples, alt_m, float)
+
+    for k in range(samples):
+        gN, gE = gust_gen(k)  # colored gust at sample k (arrays length 1)
+        wN = wN_mean + float(gN[0])
+        wE = wE_mean + float(gE[0])
+        # body-heading equals track angle on a steady circle
+        vgN_true = Va_mps*np.cos(psi[k]) + wN
+        vgE_true = Va_mps*np.sin(psi[k]) + wE
+        # add sensor/fit noise
+        vgN[k] = vgN_true + np.random.randn()*noise_mps
+        vgE[k] = vgE_true + np.random.randn()*noise_mps
+
+    return estimate_wind_pin_from_ring(vgN=vgN, vgE=vgE, Va=Va, psi=psi, z=z)
+
 
 def simulate_loiter_pins(alts: List[float], Va: float, R: float, samples: int,
-                         true_wind: Callable[[float],Tuple[float,float]], noise: float) -> List[Dict]:
+                         true_wind: Callable[[float],Tuple[float,float]],
+                         noise: float,
+                         gust_sigma_mps: float = 0.0,
+                         gust_tau_s: float = 3.0,
+                         rng_seed: Optional[int] = None,
+                         completely_different:bool = False) -> List[Dict]:
     pins = []
-    for z in alts:
-        pins.append(simulate_loiter_ring(z, Va, R, samples, true_wind, noise))
+    for i, z in enumerate(alts):
+        pins.append(simulate_loiter_ring(
+            alt_m=z, Va_mps=Va, R_m=R, samples=samples,
+            true_wind=true_wind, noise_mps=noise,
+            gust_sigma_mps=gust_sigma_mps, gust_tau_s=gust_tau_s,
+            rng_seed=None if rng_seed is None else (rng_seed + i),
+            completely_different=False
+        ))
     return pins
 
 # =========================
@@ -565,6 +754,7 @@ def simulate_parafoil_drop(release_NE, wind_func, turb_sigma=0.0):
     miss = math.hypot(pN - tgtN, pE - tgtE)
     return np.array(Xs), np.array(Ys), miss
 
+def rmse(a, b): return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b))**2)))
 
 def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
     R = CFG.loiter_ring_R_m
@@ -587,52 +777,96 @@ def main():
     os.makedirs(CFG.out_dir, exist_ok=True)
 
     # Prior
-    prior = build_prior_from_csv(CFG.prior_csv_path, sigma_floor=CFG.prior_sigma_floor_mps)
-
+    if CFG.prior_mode == "csv":
+        prior = build_prior_from_csv(CFG.prior_csv_path, sigma_floor=CFG.prior_sigma_floor_mps)
+    elif CFG.prior_mode == "random":
+        prior = build_prior_random(CFG.z_min, CFG.z_max, CFG.dz, CFG)
+    elif CFG.prior_mode == "none":
+        prior = None
+    else:
+        raise ValueError(f"Unknown prior_mode: {CFG.prior_mode}")
+    
     # Pins: load real logs or simulate
     if CFG.loiter_samples_csv:
         pins = load_loiter_pins_from_csv(CFG.loiter_samples_csv)
         pins_src = "real"
     else:
-        # Sim rings: by default, around release altitude ±200 m
         if CFG.sim_loiter_alts_m is None:
-            # CFG.sim_loiter_alts_m = [CFG.z_release - 200, CFG.z_release, CFG.z_release + 200]
-            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 200, CFG.z_release + 401, 50).tolist()
-        pins = simulate_loiter_pins(
-            alts=CFG.sim_loiter_alts_m,
-            Va=CFG.sim_loiter_Va_mps,
-            R=CFG.sim_loiter_radius_m,
-            samples=CFG.sim_samples_per_circle,
-            true_wind=prior.wind,             # you could inject deviations here
-            noise=CFG.sim_meas_noise_mps
-        )
-        pins_src = "simulated"
+            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 200, CFG.z_release, 50).tolist()
+
+        # true_wind function for sim: use prior.wind if available, else flat zero
+        true_wind_func = (prior.wind if prior is not None else (lambda z: (0.0, 0.0)))
+
+        if CFG.completely_different:
+            # build truth data
+            truth = build_truth_from_prior(prior, mode="biased_shear", 
+                                           scaleN=1.8, 
+                                           scaleE=-1.2, shearE=0.003)
+            print("Each loiter ring will have completely different mean wind (for testing)")
+            pins = simulate_loiter_pins(
+                alts=CFG.sim_loiter_alts_m,
+                Va=CFG.sim_loiter_Va_mps,
+                R=CFG.sim_loiter_radius_m,
+                samples=CFG.sim_samples_per_circle,
+                true_wind=truth.wind,     # <<< was prior.wind; now generate data from TRUTH
+                noise=CFG.sim_meas_noise_mps
+            )
+            pins_src = "simulated-from-truth"
+        else:
+            pins = simulate_loiter_pins(
+                alts=CFG.sim_loiter_alts_m,
+                Va=CFG.sim_loiter_Va_mps,
+                R=CFG.sim_loiter_radius_m,
+                samples=CFG.sim_samples_per_circle,
+                true_wind=true_wind_func,
+                noise=CFG.sim_meas_noise_mps,
+                gust_sigma_mps=CFG.gust_sigma_mps,
+                gust_tau_s=CFG.gust_tau_s,
+                rng_seed=CFG.random_seed,
+                completely_different=CFG.completely_different
+            )
+            pins_src = "simulated"
 
     # Fusion grid bounds if not given
     # Pins-only vertical model (no fusion with prior)
     zmin = CFG.z_min
     zmax = CFG.z_max
+    use_prior_for_gp = (prior is not None)
+    # updated_wind, updated_std, pdbg = profile_from_pins_gp(
+    #     pins,
+    #     z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
+    #     cfg=PinsGPCfg(
+    #         length_scale_m=400.0,
+    #         nu=1.5,
+    #         use_rq=False,
+    #         add_linear=True,
+    #         sigma_floor_mps=0.6,
+    #         clamp_margin_m=50.0
+    #     ),
+    #     prior=(prior if use_prior_for_gp else None),
+    #     blend_width_m=150.0 if use_prior_for_gp else 0.0
+    # )
+    cfg = PinsGPCfg(
+        length_scale_m=50,   # was 400
+        nu=1.5,                 # rougher, tracks pins more
+        use_rq=True,            # multi-scale
+        add_linear=True,        # trend-aware
+        sigma_floor_mps=0.8,    # a bit more conservative
+        clamp_margin_m=200.0    # was 50
+    )
     updated_wind, updated_std, pdbg = profile_from_pins_gp(
         pins,
         z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
-        cfg=PinsGPCfg(
-            length_scale_m=400.0,   # 200–600 typical
-            nu=1.5,                 # 1.5 rougher, 2.5 smoother
-            use_rq=False,
-            add_linear=True,        # << enables linear trend extrapolation
-            sigma_floor_mps=0.6,
-            clamp_margin_m=50.0
-        ),
-        prior=prior,                # << residual GP around your prior
-        blend_width_m=150.0         # << smooth fade to the prior outside pins
+        cfg=cfg,
+        prior=prior,            # or try prior=None
+        blend_width_m=0.0       # try 0 to see raw GP; then re-enable if needed
     )
+
     # CARP using layer wind at release
     wN_layer, wE_layer = updated_wind(CFG.z_release)
     carp_NE, carp_err = carp_from_layer_wind(wN_layer, wE_layer)
-
     # Deterministic drop with FULL updated profile
     X_det, Y_det, miss_det = simulate_parafoil_drop(carp_NE, updated_wind, turb_sigma=0.0)
-
     # Monte-Carlo with altitude-dependent uncertainty
     impacts = []
     for _ in range(CFG.N_mc):
@@ -676,11 +910,16 @@ def main():
     #                      max(prior.z.max(), fdbg["z_grid"].max()), 300)
     z_plot = np.linspace(zmin, zmax, 300)
     prior_wN = np.array([prior.wind(z)[0] for z in z_plot])
+    if prior is not None:
+        prior_wN = np.array([prior.wind(z)[0] for z in z_plot])
+        axs[0].plot(prior_wN, z_plot, 'C0--', alpha=0.5, label='prior wN (ref)')
     post_wN  = np.array([updated_wind(z)[0] for z in z_plot])
     post_sN  = np.array([updated_std(z)[0]  for z in z_plot])
-    axs[0].plot(prior_wN, z_plot, 'C0--', alpha=0.5, label='prior wN (ref)')
+    
+    # axs[0].plot(prior_wN, z_plot, 'C0--', alpha=0.5, label='prior wN (ref)')
     axs[0].plot(post_wN,  z_plot, 'C0-',  label='pins-only wN')
-    axs[0].fill_betweenx(z_plot, post_wN - 2*post_sN, post_wN + 2*post_sN, color='C0', alpha=0.12, label='±2σ')
+    axs[0].fill_betweenx(z_plot, post_wN - 2*post_sN, post_wN + 2*post_sN, 
+                         color='C0', alpha=0.12, label='±2σ')
     # axs[0].plot(post_wN, z_plot, 'C0-',  label='updated wN')
     #axs[0].fill_betweenx(z_plot, post_wN - 2*post_sN, post_wN + 2*post_sN, color='C0', alpha=0.15, label='±2σ')
     axs[0].invert_yaxis(); axs[0].grid(True)
@@ -695,7 +934,8 @@ def main():
     post_sE  = np.array([updated_std(z)[1]  for z in z_plot])
     axs[1].plot(prior_wE, z_plot, 'C1--', alpha=0.5, label='prior wE (ref)')
     axs[1].plot(post_wE,  z_plot, 'C1-',  label='pins-only wE')
-    axs[1].fill_betweenx(z_plot, post_wE - 2*post_sE, post_wE + 2*post_sE, color='C1', alpha=0.12, label='±2σ')
+    axs[1].fill_betweenx(z_plot, post_wE - 2*post_sE, post_wE + 2*post_sE, 
+                         color='C1', alpha=0.12, label='±2σ')
 
     axs[1].plot(post_wE, z_plot, 'C1-',  label='updated wE')
     axs[1].invert_yaxis(); axs[1].grid(True)
@@ -703,6 +943,29 @@ def main():
     axs[1].set_title("East wind profile")
     for p in pins:
         axs[1].plot([p["wE"]], [p["z"]], 'ko', ms=4)
+
+    if CFG.completely_different:
+        # curves on a common altitude grid
+        truth_wN = np.array([truth.wind(z)[0] for z in z_plot])
+        truth_wE = np.array([truth.wind(z)[1] for z in z_plot])
+
+        rmseN = rmse(post_wN, truth_wN)
+        rmseE = rmse(post_wE, truth_wE)
+
+        # coverage: fraction of truth lying inside posterior ±2σ (per component)
+        covN = float(np.mean((truth_wN >= post_wN - 2*post_sN) & (truth_wN <= post_wN + 2*post_sN)))
+        covE = float(np.mean((truth_wE >= post_wE - 2*post_sE) & (truth_wE <= post_wE + 2*post_sE)))
+        # (1) North
+        axs[0].plot(truth_wN, z_plot, color=GROUND_TRUTH_COLOR,
+                    lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wN', linestyle='--')
+        axs[0].set_title(f"North wind profile — GP vs truth  \
+            (RMSE={rmseN:.2f} m/s, cov≈{100*covN:.0f}%)")
+
+        # (2) East
+        axs[1].plot(truth_wE, z_plot, color=GROUND_TRUTH_COLOR, 
+                    lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wE', linestyle='--')
+        axs[1].set_title(f"East wind profile — GP vs truth   \
+            (RMSE={rmseE:.2f} m/s, cov≈{100*covE:.0f}%)")
 
     # (3) CARP + deterministic path (x=E, y=N)
     ring_t = np.linspace(0,2*np.pi,361)
@@ -754,9 +1017,11 @@ if __name__ == "__main__":
     CFG = Config()
 
     CFG.prior_csv_path = csvs[1] if csvs else CFG.prior_csv_path
-    print(f"Using prior CSV: {CFG.prior_csv_path}")
+    CFG.completely_different = False
+    #CFG.prior_mode = ""
+    #print(f"Using prior CSV: {CFG.prior_csv_path}")
     #csv_file = open_csv_by_index(csvs, 0)  # change index to select different file
-    for i in range(5):
+    for i in range(3):
         # randomize seed for each run
         np.random.seed()
         main()
