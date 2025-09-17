@@ -12,7 +12,6 @@ import os, math, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Tuple, Callable, List, Dict, Optional
-
 try:
     from scipy.interpolate import PchipInterpolator
     HAS_SCIPY = True
@@ -27,9 +26,38 @@ try:
 except Exception:
     HAS_SKLEARN = False
 
-
+PINS_COLOR: str = "red"
 GROUND_TRUTH_COLOR: str = 'black'  # color for ground truth wind profile in plots
 GROUND_TRUTH_ALPHA : float = 0.5  # alpha for ground truth wind profile in plots
+
+import matplotlib.pyplot as plt
+
+plt.rcParams.update({
+    # Font sizes
+    'font.size': 16,           # general
+    'axes.titlesize': 18,      # title
+    'axes.labelsize': 16,      # x/y labels
+    'xtick.labelsize': 14,
+    'ytick.labelsize': 14,
+    'legend.fontsize': 14,
+
+    # Figure sizes
+    'figure.figsize': (8, 5),  # ~16:10 good for slides
+    'figure.dpi': 150,         # good for screen (use 300+ for print)
+
+    # Lines
+    'lines.linewidth': 2.5,
+    'lines.markersize': 8,
+
+    # Grid
+    'grid.color': 'lightgray',
+    'grid.linestyle': '--',
+    'grid.linewidth': 0.7,
+
+    # Layout
+    'figure.autolayout': True,
+})
+
 
 @dataclass
 class PinsSmoothCfg:
@@ -250,6 +278,10 @@ class Config:
     # time, vgN, vgE, Va, psi_rad, z, ring_id   (psi in radians; speeds m/s; altitude m AGL)
     loiter_samples_csv: str | None = None      # e.g., "/mnt/data/loiter_logs.csv"
 
+    truth_mode: str = "same_as_prior"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
+    truth_csv_path: str | None = None       # used if truth_mode == "csv"
+    use_truth_for_pins: bool = True         # if True, pins are generated from truth, not prior
+
     # --- Prior source ---
     prior_mode: str = "csv"            # "csv" | "random" | "none"
     random_seed: Optional[int] = 1234  # None → truly random each run
@@ -273,7 +305,7 @@ class Config:
     sim_meas_noise_mps: float = 0.5            # noise on vg components
 
     # --- Fusion grid ---
-    z_min: float = 1600.0
+    z_min: float = 1500.0
     z_max: float = 2500.0
     dz: float = 20.0
     prior_sigma_floor_mps: float = 2.0         # conservative prior std per component
@@ -381,6 +413,7 @@ def _blend_to_prior(mu_gp: np.ndarray, mu_prior: np.ndarray,
     return w*mu_gp + (1.0 - w)*mu_prior
 
 
+
 # =========================
 # 1) PRIOR from CSV
 # =========================
@@ -431,8 +464,8 @@ class Truth:
 def build_truth_from_prior(
     prior: Prior,
     mode: str = "biased_shear",
-    scaleN: float = 1.5,   # m/s amplitude for N bias "bump"
-    scaleE: float = -0.8,  # m/s offset for E bias
+    scaleN: float = 3.0,   # m/s amplitude for N bias "bump"
+    scaleE: float = -2.0,  # m/s offset for E bias
     shearE: float = 0.002  # (m/s) per meter shear in E
 ) -> Truth:
     """
@@ -447,7 +480,11 @@ def build_truth_from_prior(
         wN0, wE0 = prior.wind(z)
         bumpN = scaleN * np.exp(-0.5 * ((z - 2200.0) / 300.0) ** 2)
         biasE = scaleE + shearE * (z - 2000.0)
-        return (wN0 + bumpN, wE0 + biasE)
+        # randomize the bias a bit to avoid perfect symmetry
+        final_wind_N = wN0 + bumpN + np.random.normal(scale=0.4)
+        final_wind_E = wE0 + biasE + np.random.normal(scale=0.4)
+        # random sign change
+        return (final_wind_N, final_wind_E)
 
     return Truth(wind=truth_wind)
 
@@ -603,12 +640,12 @@ def simulate_loiter_ring(alt_m: float, Va_mps: float, R_m: float, samples: int,
 
     # Mean (background) wind at this altitude
     wN_mean, wE_mean = true_wind(alt_m)
-    if completely_different:
-        # for testing: make this ring's mean wind completely different from true_wind
-        rng = np.random.default_rng(rng_seed)
-        wN_mean += rng.normal(scale=3.0)
-        wE_mean += rng.normal(scale=3.0)
-        print(f"Simulating ring at {alt_m:.1f} m with mean wind (wN,wE)=({wN_mean:.2f},{wE_mean:.2f}) m/s")
+    # if completely_different:
+    #     # for testing: make this ring's mean wind completely different from true_wind
+    #     rng = np.random.default_rng(rng_seed)
+    #     wN_mean += rng.normal(scale=1.0)
+    #     wE_mean += rng.normal(scale=1.0)
+    #     print(f"Simulating ring at {alt_m:.1f} m with mean wind (wN,wE)=({wN_mean:.2f},{wE_mean:.2f}) m/s")
 
     # Build time series
     vgN = np.zeros(samples, float)
@@ -639,12 +676,13 @@ def simulate_loiter_pins(alts: List[float], Va: float, R: float, samples: int,
                          completely_different:bool = False) -> List[Dict]:
     pins = []
     for i, z in enumerate(alts):
+        # in simulate_loiter_pins(...)
         pins.append(simulate_loiter_ring(
             alt_m=z, Va_mps=Va, R_m=R, samples=samples,
             true_wind=true_wind, noise_mps=noise,
             gust_sigma_mps=gust_sigma_mps, gust_tau_s=gust_tau_s,
             rng_seed=None if rng_seed is None else (rng_seed + i),
-            completely_different=False
+            completely_different=completely_different   # <— pass through
         ))
     return pins
 
@@ -769,6 +807,105 @@ def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
             best_d, best_NE = miss, np.array([relN, relE])
     return best_NE, best_d
 
+# =========================
+# PLOT utilities
+# =========================
+
+def plot_wind_profile(prior:Prior,
+                      config:Config,
+                      pins:List[Dict],
+                      pins_src:str,
+                      updated_wind:callable,
+                      updated_std:callable,
+                      zmin:float, 
+                      zmax:float,
+                      spacing:int,
+                      truth:Truth = None,
+                      save:bool = False,
+                      file_name:str = "") -> Tuple[plt.Figure, plt.Axes]:
+    """
+    x axis will be altitude 
+    y axis will be the wind speed
+    dashed line is the ground truth
+    - solid line is the prior from the gp 
+    - dashed line is the 
+    """
+        
+    fig, axs = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+    z_plot = np.linspace(zmin, zmax, 300)
+
+    # (1) Prior + updated profile (wN)
+    if prior is not None:
+        prior_wN = np.array([prior.wind(z)[0] for z in z_plot])
+        axs[0].plot(z_plot, prior_wN, 'C0--', alpha=0.5, label='prior wN (ref)')
+
+    post_wN = np.array([updated_wind(z)[0] for z in z_plot])
+    post_sN = np.array([updated_std(z)[0] for z in z_plot])
+    axs[0].plot(z_plot, post_wN, 'C0-', label='pins-only wN')
+    axs[0].fill_between(z_plot, post_wN - 2*post_sN, post_wN + 2*post_sN,
+                        color='C0', alpha=0.12, label='±2σ')
+
+    axs[0].invert_xaxis()  # optional, makes altitude decrease left-to-right
+    axs[0].grid(True)
+    axs[0].set_ylabel("wN [m/s]")
+    axs[0].set_title(f"North wind profile — pins ({pins_src})")
+
+    for i,p in enumerate(pins):
+        if i == 0:
+            axs[0].plot(p["z"], p["wN"], 'ko', ms=4, color=PINS_COLOR, label='Loiter pins')
+        else:
+            axs[0].plot(p["z"], p["wN"], 'ko', ms=4, color=PINS_COLOR)
+
+    # (2) Prior + updated profile (wE)
+    if prior is not None:
+        prior_wE = np.array([prior.wind(z)[1] for z in z_plot])
+        axs[1].plot(z_plot, prior_wE, 'C1--', alpha=0.5, label='prior wE (ref)')
+
+    post_wE = np.array([updated_wind(z)[1] for z in z_plot])
+    post_sE = np.array([updated_std(z)[1] for z in z_plot])
+    axs[1].plot(z_plot, post_wE, 'C1-', label='pins-only wE')
+    axs[1].fill_between(z_plot, post_wE - 2*post_sE, post_wE + 2*post_sE,
+                        color='C1', alpha=0.12, label='±2σ')
+
+    axs[1].invert_xaxis()
+    axs[1].grid(True)
+    axs[1].set_ylabel("wE [m/s]")
+    axs[1].set_xlabel("Altitude [m]")
+    axs[1].set_title("East wind profile")
+
+    for i, p in enumerate(pins):
+        if i == 0:
+            axs[1].plot(p["z"], p["wE"], 'ko', ms=4, color=PINS_COLOR, label='Loiter pins')
+        else:
+            axs[1].plot(p["z"], p["wE"], 'ko', ms=4, color=PINS_COLOR,)
+
+    # (3) Truth comparison
+    if truth is not None:
+        truth_wN = np.array([truth.wind(z)[0] for z in z_plot])
+        truth_wE = np.array([truth.wind(z)[1] for z in z_plot])
+
+        rmseN = rmse(post_wN, truth_wN)
+        rmseE = rmse(post_wE, truth_wE)
+        covN = float(np.mean((truth_wN >= post_wN - 2*post_sN) & (truth_wN <= post_wN + 2*post_sN)))
+        covE = float(np.mean((truth_wE >= post_wE - 2*post_sE) & (truth_wE <= post_wE + 2*post_sE)))
+
+        axs[0].plot(z_plot, truth_wN, color=GROUND_TRUTH_COLOR, lw=2, alpha=GROUND_TRUTH_ALPHA,
+                    ls='--', label='truth wN')
+        axs[1].plot(z_plot, truth_wE, color=GROUND_TRUTH_COLOR, lw=2, alpha=GROUND_TRUTH_ALPHA,
+                    ls='--', label='truth wE')
+
+        axs[0].set_title(f"North wind — GP vs truth (RMSE={rmseN:.2f} m/s, cov≈{100*covN:.0f}%)")
+        axs[1].set_title(f"East wind — GP vs truth  (RMSE={rmseE:.2f} m/s, cov≈{100*covE:.0f}%)")
+
+    axs[0].legend(loc='best')
+    axs[1].legend(loc='best')
+
+    if save:
+        plt.savefig(file_name, dpi=400)
+        plt.savefig(file_name + ".svg")
+
+    return fig, axs
 
 # =========================
 # 5) RUN THE PIPELINE
@@ -776,7 +913,7 @@ def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
 def main():
     os.makedirs(CFG.out_dir, exist_ok=True)
 
-    # Prior
+    # # Prior
     if CFG.prior_mode == "csv":
         prior = build_prior_from_csv(CFG.prior_csv_path, sigma_floor=CFG.prior_sigma_floor_mps)
     elif CFG.prior_mode == "random":
@@ -785,90 +922,96 @@ def main():
         prior = None
     else:
         raise ValueError(f"Unknown prior_mode: {CFG.prior_mode}")
-    
-    # Pins: load real logs or simulate
+
+    truth = None
+    if CFG.truth_mode == "none":
+        truth = None
+    elif CFG.truth_mode == "same_as_prior":
+        truth = Truth(wind=(prior.wind if prior is not None else (lambda z: (0.0, 0.0))))
+    elif CFG.truth_mode == "csv":
+        tr = build_prior_from_csv(CFG.truth_csv_path, sigma_floor=1.0)  # reuse loader
+        truth = Truth(wind=tr.wind)
+    else:  # "biased_from_prior" (default)
+        # If prior is None, fall back to a simple synthetic profile
+        base_prior = prior if prior is not None else build_prior_random(CFG.z_min, CFG.z_max, CFG.dz, CFG)
+        truth = build_truth_from_prior(base_prior, mode="biased_shear", scaleN=1.8, scaleE=-1.2, shearE=0.003)
+
+    # num of laps 50 as standard, more is 25
     if CFG.loiter_samples_csv:
         pins = load_loiter_pins_from_csv(CFG.loiter_samples_csv)
         pins_src = "real"
     else:
         if CFG.sim_loiter_alts_m is None:
-            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 200, CFG.z_release, 50).tolist()
+            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 400, CFG.z_release + 200, 50).tolist()
 
-        # true_wind function for sim: use prior.wind if available, else flat zero
-        true_wind_func = (prior.wind if prior is not None else (lambda z: (0.0, 0.0)))
+        wind_for_pins = (truth.wind if (truth is not None and CFG.use_truth_for_pins)
+                        else (prior.wind if prior is not None else (lambda z: (0.0, 0.0))))
 
-        if CFG.completely_different:
-            # build truth data
-            truth = build_truth_from_prior(prior, mode="biased_shear", 
-                                           scaleN=1.8, 
-                                           scaleE=-1.2, shearE=0.003)
-            print("Each loiter ring will have completely different mean wind (for testing)")
-            pins = simulate_loiter_pins(
-                alts=CFG.sim_loiter_alts_m,
-                Va=CFG.sim_loiter_Va_mps,
-                R=CFG.sim_loiter_radius_m,
-                samples=CFG.sim_samples_per_circle,
-                true_wind=truth.wind,     # <<< was prior.wind; now generate data from TRUTH
-                noise=CFG.sim_meas_noise_mps
-            )
-            pins_src = "simulated-from-truth"
-        else:
-            pins = simulate_loiter_pins(
-                alts=CFG.sim_loiter_alts_m,
-                Va=CFG.sim_loiter_Va_mps,
-                R=CFG.sim_loiter_radius_m,
-                samples=CFG.sim_samples_per_circle,
-                true_wind=true_wind_func,
-                noise=CFG.sim_meas_noise_mps,
-                gust_sigma_mps=CFG.gust_sigma_mps,
-                gust_tau_s=CFG.gust_tau_s,
-                rng_seed=CFG.random_seed,
-                completely_different=CFG.completely_different
-            )
-            pins_src = "simulated"
+        pins = simulate_loiter_pins(
+            alts=CFG.sim_loiter_alts_m,
+            Va=CFG.sim_loiter_Va_mps,
+            R=CFG.sim_loiter_radius_m,
+            samples=CFG.sim_samples_per_circle,
+            true_wind=wind_for_pins,
+            noise=CFG.sim_meas_noise_mps,
+            gust_sigma_mps=CFG.gust_sigma_mps,
+            gust_tau_s=CFG.gust_tau_s,
+            rng_seed=CFG.random_seed,
+            completely_different=CFG.completely_different
+        )
+        pins_src = "simulated-from-truth" if (truth is not None and CFG.use_truth_for_pins) else "simulated"
+    
 
     # Fusion grid bounds if not given
     # Pins-only vertical model (no fusion with prior)
     zmin = CFG.z_min
     zmax = CFG.z_max
     use_prior_for_gp = (prior is not None)
-    # updated_wind, updated_std, pdbg = profile_from_pins_gp(
-    #     pins,
-    #     z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
-    #     cfg=PinsGPCfg(
-    #         length_scale_m=400.0,
-    #         nu=1.5,
-    #         use_rq=False,
-    #         add_linear=True,
-    #         sigma_floor_mps=0.6,
-    #         clamp_margin_m=50.0
-    #     ),
-    #     prior=(prior if use_prior_for_gp else None),
-    #     blend_width_m=150.0 if use_prior_for_gp else 0.0
-    # )
-    cfg = PinsGPCfg(
-        length_scale_m=50,   # was 400
-        nu=1.5,                 # rougher, tracks pins more
-        use_rq=True,            # multi-scale
-        add_linear=True,        # trend-aware
-        sigma_floor_mps=0.8,    # a bit more conservative
-        clamp_margin_m=200.0    # was 50
-    )
+    import time 
+    start_time = time.time()
     updated_wind, updated_std, pdbg = profile_from_pins_gp(
         pins,
         z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
-        cfg=cfg,
-        prior=prior,            # or try prior=None
-        blend_width_m=0.0       # try 0 to see raw GP; then re-enable if needed
+        cfg=PinsGPCfg(
+            length_scale_m=400.0,
+            nu=1.5,
+            use_rq=False,
+            add_linear=True,
+            sigma_floor_mps=0.6,
+            clamp_margin_m=50.0
+        ),
+        prior=(prior if use_prior_for_gp else None),
+        blend_width_m=150.0 if use_prior_for_gp else 0.0
     )
+    final_time = time.time()
+    print(f"GP fitting took {final_time - start_time:.2f} seconds")
+    # cfg = PinsGPCfg(
+    #     length_scale_m=50,   # was 400
+    #     nu=1.5,                 # rougher, tracks pins more
+    #     use_rq=True,            # multi-scale
+    #     add_linear=True,        # trend-aware
+    #     sigma_floor_mps=0.8,    # a bit more conservative
+    #     clamp_margin_m=200.0    # was 50
+    # )
+    # updated_wind, updated_std, pdbg = profile_from_pins_gp(
+    #     pins,
+    #     z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
+    #     cfg=cfg,
+    #     prior=prior,            # or try prior=None
+    #     blend_width_m=0.0       # try 0 to see raw GP; then re-enable if needed
+    # )
 
     # CARP using layer wind at release
     wN_layer, wE_layer = updated_wind(CFG.z_release)
+    start_time = time.time()
     carp_NE, carp_err = carp_from_layer_wind(wN_layer, wE_layer)
     # Deterministic drop with FULL updated profile
     X_det, Y_det, miss_det = simulate_parafoil_drop(carp_NE, updated_wind, turb_sigma=0.0)
+    final_time = time.time()
+    print(f"CARP + deterministic drop took {final_time - start_time:.2f} seconds")
     # Monte-Carlo with altitude-dependent uncertainty
     impacts = []
+    start_time = time.time()
     for _ in range(CFG.N_mc):
         def wind_mc(z):
             muN, muE = updated_wind(z)
@@ -876,8 +1019,9 @@ def main():
             return np.random.normal(muN, sN), np.random.normal(muE, sE)
         X, Y, _ = simulate_parafoil_drop(carp_NE, wind_mc, turb_sigma=CFG.turb_sigma_mps)
         impacts.append([X[-1], Y[-1]])  # (x=E, y=N)
+    final_time = time.time()
+    print(f"CARP + {CFG.N_mc} MC drops took {final_time - start_time:.2f} seconds")
     impacts = np.array(impacts)
-
     # Ellipse + region box (computed in x=E, y=N space)
     mean_xy = impacts.mean(axis=0)
     cov_xy = np.cov(impacts.T)
@@ -937,35 +1081,48 @@ def main():
     axs[1].fill_betweenx(z_plot, post_wE - 2*post_sE, post_wE + 2*post_sE, 
                          color='C1', alpha=0.12, label='±2σ')
 
-    axs[1].plot(post_wE, z_plot, 'C1-',  label='updated wE')
     axs[1].invert_yaxis(); axs[1].grid(True)
     axs[1].set_xlabel("wE [m/s]"); axs[1].set_ylabel("Altitude [m]")
     axs[1].set_title("East wind profile")
     for p in pins:
         axs[1].plot([p["wE"]], [p["z"]], 'ko', ms=4)
 
-    if CFG.completely_different:
-        # curves on a common altitude grid
+    # if CFG.completely_different:
+    #     # curves on a common altitude grid
+    #     truth_wN = np.array([truth.wind(z)[0] for z in z_plot])
+    #     truth_wE = np.array([truth.wind(z)[1] for z in z_plot])
+
+    #     rmseN = rmse(post_wN, truth_wN)
+    #     rmseE = rmse(post_wE, truth_wE)
+
+    #     # coverage: fraction of truth lying inside posterior ±2σ (per component)
+    #     covN = float(np.mean((truth_wN >= post_wN - 2*post_sN) & (truth_wN <= post_wN + 2*post_sN)))
+    #     covE = float(np.mean((truth_wE >= post_wE - 2*post_sE) & (truth_wE <= post_wE + 2*post_sE)))
+    #     # (1) North
+    #     axs[0].plot(truth_wN, z_plot, color=GROUND_TRUTH_COLOR,
+    #                 lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wN', linestyle='--')
+    #     axs[0].set_title(f"North wind profile — GP vs truth  \
+    #         (RMSE={rmseN:.2f} m/s, cov≈{100*covN:.0f}%)")
+
+    #     # (2) East
+    #     axs[1].plot(truth_wE, z_plot, color=GROUND_TRUTH_COLOR, 
+    #                 lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wE', linestyle='--')
+    #     axs[1].set_title(f"East wind profile — GP vs truth   \
+    #         (RMSE={rmseE:.2f} m/s, cov≈{100*covE:.0f}%)")
+    
+    if truth is not None:
         truth_wN = np.array([truth.wind(z)[0] for z in z_plot])
         truth_wE = np.array([truth.wind(z)[1] for z in z_plot])
 
-        rmseN = rmse(post_wN, truth_wN)
-        rmseE = rmse(post_wE, truth_wE)
-
-        # coverage: fraction of truth lying inside posterior ±2σ (per component)
+        rmseN = rmse(post_wN, truth_wN); rmseE = rmse(post_wE, truth_wE)
         covN = float(np.mean((truth_wN >= post_wN - 2*post_sN) & (truth_wN <= post_wN + 2*post_sN)))
         covE = float(np.mean((truth_wE >= post_wE - 2*post_sE) & (truth_wE <= post_wE + 2*post_sE)))
-        # (1) North
-        axs[0].plot(truth_wN, z_plot, color=GROUND_TRUTH_COLOR,
-                    lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wN', linestyle='--')
-        axs[0].set_title(f"North wind profile — GP vs truth  \
-            (RMSE={rmseN:.2f} m/s, cov≈{100*covN:.0f}%)")
 
-        # (2) East
-        axs[1].plot(truth_wE, z_plot, color=GROUND_TRUTH_COLOR, 
-                    lw=2, alpha=GROUND_TRUTH_ALPHA, label='truth wE', linestyle='--')
-        axs[1].set_title(f"East wind profile — GP vs truth   \
-            (RMSE={rmseE:.2f} m/s, cov≈{100*covE:.0f}%)")
+        axs[0].plot(truth_wN, z_plot, color=GROUND_TRUTH_COLOR, lw=2, alpha=GROUND_TRUTH_ALPHA, ls='--', label='truth wN')
+        axs[1].plot(truth_wE, z_plot, color=GROUND_TRUTH_COLOR, lw=2, alpha=GROUND_TRUTH_ALPHA, ls='--', label='truth wE')
+
+        axs[0].set_title(f"North wind — GP vs truth (RMSE={rmseN:.2f} m/s, cov≈{100*covN:.0f}%)")
+        axs[1].set_title(f"East wind — GP vs truth  (RMSE={rmseE:.2f} m/s, cov≈{100*covE:.0f}%)")
 
     # (3) CARP + deterministic path (x=E, y=N)
     ring_t = np.linspace(0,2*np.pi,361)
@@ -1007,8 +1164,21 @@ def main():
     # ax.legend()
 
     plt.tight_layout()
-    fig_path = os.path.join(CFG.out_dir, "wind_pipeline_results.png")
+    fig_path = os.path.join(CFG.out_dir, "wind_pipeline_results_same.png")
     plt.savefig(fig_path, dpi=150)
+    
+    figures, axs = plot_wind_profile(prior=prior, 
+                      config=CFG,
+                      pins=pins,
+                      pins_src=pins_src,
+                      updated_wind=updated_wind,
+                      updated_std=updated_std,
+                      zmin=zmin,
+                      zmax=zmax,
+                      truth=truth,
+                      spacing=300,
+                      save=True,
+                      file_name="figs/wind_profile_matching")    
 
 if __name__ == "__main__":
     plt.close('all')
@@ -1017,11 +1187,14 @@ if __name__ == "__main__":
     CFG = Config()
 
     CFG.prior_csv_path = csvs[1] if csvs else CFG.prior_csv_path
-    CFG.completely_different = False
-    #CFG.prior_mode = ""
+    CFG.completely_different = True
+    CFG.prior_mode = "csv"
+    CFG.truth_mode: str = "csv"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
+    CFG.truth_csv_path = csvs[1]
     #print(f"Using prior CSV: {CFG.prior_csv_path}")
     #csv_file = open_csv_by_index(csvs, 0)  # change index to select different file
-    for i in range(3):
+    for i in range(1):
         # randomize seed for each run
         np.random.seed()
         main()
+        plt.show()
