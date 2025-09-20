@@ -42,7 +42,7 @@ def plot_wind_profile(prior:Prior,
     - dashed line is the 
     """
     
-    fig , axs = plt.subplots(1, 2, figsize=(14, 6))
+    fig , axs = plt.subplots(1, 2, figsize=(10, 6))
     z_plot = np.linspace(zmin, zmax, 300)
     prior_wN = np.array([prior.wind(z)[0] for z in z_plot])
     if prior is not None:
@@ -101,3 +101,41 @@ def plot_wind_profile(prior:Prior,
         
 
     return fig, axs
+
+def plot_carp_paths(config:Config, history_x:List[np.ndarray], 
+                    history_y:List[np.ndarray], history_z:List[np.ndarray],
+                    scores:List[float], save:bool=False) -> None:
+    """
+    Plot the CARP paths
+    We want to find the best release point for our payload using 
+    our updated Posterior wind profile
+    Choose the Carp that minimizes the distance to the target location
+    """
+    # make a 3d plot
+    # fig = plt.figure(figsize=(8, 6))
+    # ax = fig.add_subplot(111, projection='3d')
+    # for i in range(len(history_x)):
+    #     ax.plot(history_x[i], history_y[i], history_z[i], alpha=0.3, label=f'Candidate {i+1} (miss={scores[i]:.1f} m)')
+    #     ax.scatter(history_x[i][-1], history_y[i][-1], history_z[i][-1], marker='x', s=100, color='red')
+    # ax.set_xlabel('East [m]')
+    # ax.set_ylabel('North [m]')
+    # ax.set_zlabel('Altitude [m]')
+    # ax.set_title(f'CARP candidates from {release_altitude} m altitude')
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    ring_t = np.linspace(0,2*np.pi,361)
+    ring_x = config.loiter_ring_R_m*np.sin(ring_t)  # x=E
+    ring_y = config.loiter_ring_R_m*np.cos(ring_t)  # y=N
+    ax.plot(ring_x, ring_y, color='0.7', lw=1, label='loiter ring')
+    tgtN, tgtE = config.target_NE
+    ax.scatter([tgtE],[tgtN], marker='x', s=80, label="Target")
+    # ax.scatter([carp_NE[1]],[carp_NE[0]], s=40, label="CARP")
+    # ax.plot(X_det, Y_det, lw=1.5, label=f"Deterministic drop (miss={miss_det:.1f} m)")
+    for i, (x, y, z) in enumerate(zip(history_x, history_y, history_z)):
+        ax.plot(x, y, alpha=0.3, label=f'Candidate {i+1} (miss={scores[i]:.1f} m)')
+        ax.scatter(x[-1], y[-1], marker='x', s=100, color='red')
+    ax.axis('equal'); ax.grid(True)
+    ax.set_xlabel("East [m]"); ax.set_ylabel("North [m]")
+    ax.set_title("CARP with updated profile")
+    ax.legend(loc="best")
+    
+    return fig, ax

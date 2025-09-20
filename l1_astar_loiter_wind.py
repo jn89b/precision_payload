@@ -12,6 +12,8 @@ import os, math, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Tuple, Callable, List, Dict, Optional
+import matplotlib.pyplot as plt, matplotlib.animation as anim
+
 try:
     from scipy.interpolate import PchipInterpolator
     HAS_SCIPY = True
@@ -58,6 +60,27 @@ plt.rcParams.update({
     'figure.autolayout': True,
 })
 
+
+try:
+    GROUND_TRUTH_COLOR
+except NameError:
+    GROUND_TRUTH_COLOR = 'black'
+try:
+    GROUND_TRUTH_ALPHA
+except NameError:
+    GROUND_TRUTH_ALPHA = 0.5
+
+def _rmse(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a); b = np.asarray(b)
+    return float(np.sqrt(np.mean((a - b)**2)))
+
+def _mae(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a); b = np.asarray(b)
+    return float(np.mean(np.abs(a - b)))
+
+def _bias(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a); b = np.asarray(b)
+    return float(np.mean(a - b))
 
 @dataclass
 class PinsSmoothCfg:
@@ -273,12 +296,12 @@ def profile_from_pins_gp(
 @dataclass
 class Config:
     # --- Files ---
-    prior_csv_path: str = "Balloon Wind Files/10_matlab_desc.csv"  # CSV: alt, wN, wE
+    prior_csv_path: str = "Balloon Wind Files/9_matlab_desc.csv"  # CSV: alt, wN, wE
     # If you have real loiter samples, point this to a CSV with columns:
     # time, vgN, vgE, Va, psi_rad, z, ring_id   (psi in radians; speeds m/s; altitude m AGL)
     loiter_samples_csv: str | None = None      # e.g., "/mnt/data/loiter_logs.csv"
 
-    truth_mode: str = "same_as_prior"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
+    truth_mode: str = "biased_from_prior"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
     truth_csv_path: str | None = None       # used if truth_mode == "csv"
     use_truth_for_pins: bool = True         # if True, pins are generated from truth, not prior
 
@@ -338,7 +361,7 @@ class Config:
     turb_sigma_mps: float = 0.25               # per-step white noise gust during descent
     ellipse_nsig: float = 2.0                  # ~95% for Gaussian
     box_margin_m: float = 10.0
-    start_position_noise_m: float = 40.0               # simulate GPS noise on release point
+    start_position_noise_m: float = 0.0               # simulate GPS noise on release point
     position_noise_m: float = 5.0               # simulate GPS noise on landing point
     velocity_noise_mps: float = 0.4            # simulate GPS noise on landing point
     heading_noise_deg: float = 5.0           # simulate compass noise on landing point  
@@ -740,6 +763,7 @@ def simulate_parafoil_drop(release_NE, wind_func, turb_sigma=0.0):
     pE += x_start_noise
     
     Xs, Ys = [pE], [pN]  # x=E, y=N
+    Zs = [z]
 
     while z > CFG.z_ground:
         # L1 point
@@ -787,10 +811,10 @@ def simulate_parafoil_drop(release_NE, wind_func, turb_sigma=0.0):
         pE += gE * CFG.dt
         z  -= Vsink * CFG.dt
 
-        Xs.append(pE); Ys.append(pN)
+        Xs.append(pE); Ys.append(pN); Zs.append(z)
 
     miss = math.hypot(pN - tgtN, pE - tgtE)
-    return np.array(Xs), np.array(Ys), miss
+    return np.array(Xs), np.array(Ys), np.array(Zs), miss
 
 def rmse(a, b): return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b))**2)))
 
@@ -798,14 +822,22 @@ def carp_from_layer_wind(wN_layer, wE_layer, n_candidates=90):
     R = CFG.loiter_ring_R_m
     tgtN, tgtE = CFG.target_NE
     best_d, best_NE = 1e9, None
+    history_x: List[np.ndarray] = []
+    history_y: List[np.ndarray] = []
+    history_z: List[np.ndarray] = []
+    scores: List[float] = []
     for th in np.linspace(0, 2*np.pi, n_candidates, endpoint=False):
         relN = tgtN + R*np.cos(th)
         relE = tgtE + R*np.sin(th)
         wind_const = lambda z: (wN_layer, wE_layer)
-        _, _, miss = simulate_parafoil_drop(np.array([relN, relE]), wind_const, turb_sigma=0.0)
+        x, y, z, miss = simulate_parafoil_drop(np.array([relN, relE]), wind_const, turb_sigma=0.0)
+        history_x.append(x)
+        history_y.append(y)
+        history_z.append(z)
+        scores.append(miss)
         if miss < best_d:
             best_d, best_NE = miss, np.array([relN, relE])
-    return best_NE, best_d
+    return best_NE, best_d, history_x, history_y, history_z, scores
 
 # =========================
 # PLOT utilities
@@ -905,7 +937,298 @@ def plot_wind_profile(prior:Prior,
         plt.savefig(file_name, dpi=400)
         plt.savefig(file_name + ".svg")
 
+
     return fig, axs
+
+
+def plot_wind_prior_only(
+    prior,
+    config,
+    pins: List[Dict],              # kept for signature compatibility (ignored)
+    pins_src: str,                 # kept for signature compatibility (ignored)
+    updated_wind: Callable,        # kept for signature compatibility (ignored)
+    updated_std: Callable,         # kept for signature compatibility (ignored)
+    zmin: float,
+    zmax: float,
+    spacing: int,                  # kept for signature compatibility (ignored)
+    truth = None,
+    save: bool = False,
+    file_name: str = ""
+) -> Tuple[plt.Figure, plt.Axes, Dict[str, float]]:
+    """
+    Plot ONLY the prior wind profile (wN, wE) vs altitude.
+    If `truth` is provided, compute errors between prior and truth over z in [zmin, zmax]:
+      - RMSE, MAE, and bias for wN and wE.
+    Returns (fig, axs, metrics_dict).
+    """
+
+    fig, axs = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    z_plot = np.linspace(zmin, zmax, 300)
+
+    # --- Prior ---
+    if prior is None:
+        raise ValueError("`prior` must not be None when plotting prior-only.")
+
+    prior_wN = np.array([prior.wind(z)[0] for z in z_plot])
+    prior_wE = np.array([prior.wind(z)[1] for z in z_plot])
+
+    axs[0].plot(z_plot, prior_wN, 'C0-', lw=2, label='prior wN')
+    axs[1].plot(z_plot, prior_wE, 'C1-', lw=2, label='prior wE')
+
+    # Style
+    axs[0].invert_xaxis()  # optional: altitude decreasing left->right
+    axs[1].invert_xaxis()
+    axs[0].grid(True); axs[1].grid(True)
+    axs[0].set_ylabel("wN [m/s]")
+    axs[1].set_ylabel("wE [m/s]")
+    axs[1].set_xlabel("Altitude [m]")
+
+    metrics = {}
+
+    # --- Truth and errors (optional) ---
+    if truth is not None:
+        truth_wN = np.array([truth.wind(z)[0] for z in z_plot])
+        truth_wE = np.array([truth.wind(z)[1] for z in z_plot])
+
+        axs[0].plot(z_plot, truth_wN, color=GROUND_TRUTH_COLOR, lw=2,
+                    alpha=GROUND_TRUTH_ALPHA, ls='--', label='truth wN')
+        axs[1].plot(z_plot, truth_wE, color=GROUND_TRUTH_COLOR, lw=2,
+                    alpha=GROUND_TRUTH_ALPHA, ls='--', label='truth wE')
+
+        rmseN = _rmse(prior_wN, truth_wN); maeN = _mae(prior_wN, truth_wN); biasN = _bias(prior_wN, truth_wN)
+        rmseE = _rmse(prior_wE, truth_wE); maeE = _mae(prior_wE, truth_wE); biasE = _bias(prior_wE, truth_wE)
+
+        axs[0].set_title(f"North wind — PRIOR vs truth  (RMSE={rmseN:.2f}, MAE={maeN:.2f}, bias={biasN:.2f} m/s)")
+        axs[1].set_title(f"East wind — PRIOR vs truth   (RMSE={rmseE:.2f}, MAE={maeE:.2f}, bias={biasE:.2f} m/s)")
+
+        metrics.update({
+            "rmse_wN": rmseN, "mae_wN": maeN, "bias_wN": biasN,
+            "rmse_wE": rmseE, "mae_wE": maeE, "bias_wE": biasE
+        })
+    else:
+        axs[0].set_title("North wind — PRIOR")
+        axs[1].set_title("East wind — PRIOR")
+
+    axs[0].legend(loc='best'); axs[1].legend(loc='best')
+
+    if save and file_name:
+        plt.savefig(file_name, dpi=400)
+        plt.savefig(file_name + ".svg")
+
+    return fig, axs, metrics
+
+def plot_carp_paths(config:Config, history_x:List[np.ndarray], 
+                    history_y:List[np.ndarray], history_z:List[np.ndarray],
+                    scores:List[float], save:bool=False) -> None:
+    """
+    Plot the CARP paths
+    We want to find the best release point for our payload using 
+    our updated Posterior wind profile
+    Choose the Carp that minimizes the distance to the target location
+    """
+    # make a 3d plot
+    # set a gradient color for the paths based on the score
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    ring_t = np.linspace(0,2*np.pi,361)
+    ring_x = config.loiter_ring_R_m*np.sin(ring_t)  # x=E
+    ring_y = config.loiter_ring_R_m*np.cos(ring_t)  # y=N
+    ax.plot(ring_x, ring_y, color='0.7', lw=1, label='loiter ring')
+    tgtN, tgtE = config.target_NE
+    ax.scatter([tgtE],[tgtN], marker='x', s=80, label="Target")
+    # ax.scatter([carp_NE[1]],[carp_NE[0]], s=40, label="CARP")
+    best_cand_idx = int(np.argmin(scores))
+    # ax.plot(X_det, Y_det, lw=1.5, label=f"Deterministic drop (miss={miss_det:.1f} m)")
+    for i, (x, y, z) in enumerate(zip(history_x, history_y, history_z)):
+        if i == best_cand_idx:
+            ax.plot(x, y, lw=1.8, alpha=0.9, label=f'Best candidate {i+1} (miss={scores[i]:.1f} m)')
+        else:
+            ax.plot(x, y, alpha=0.3)
+        ax.scatter(x[-1], y[-1], marker='x', s=100, color='red')
+    ax.axis('equal'); ax.grid(True)
+    ax.set_xlabel("East [m]"); ax.set_ylabel("North [m]")
+    ax.set_title("CARP with updated profile")
+    ax.legend(loc="best")
+    
+    # make a 3d plot
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6), subplot_kw={"projection": "3d"})
+    ax.plot(ring_x, ring_y, zs=config.z_release, zdir='z', color='0.7', lw=1, label='loiter ring')
+    ax.scatter([tgtE],[tgtN],[config.z_ground], marker='x', s=80, label="Target")
+    for i, (x, y, z) in enumerate(zip(history_x, history_y, history_z)):
+        if i == best_cand_idx:
+            ax.plot(x, y, zs=z, zdir='z', lw=1.8, alpha=0.9, label=f'Best candidate {i+1} (miss={scores[i]:.1f} m)')
+        else:    
+            ax.plot(x, y, zs=z, zdir='z', alpha=0.3)
+        ax.scatter(x[-1], y[-1], zs=z[-1], zdir='z', marker='x', s=100, color='red')
+    ax.set_xlabel("East [m]"); ax.set_ylabel("North [m]"); ax.set_zlabel("Altitude [m]")
+    ax.set_title("CARP with updated profile (3D view)")
+    ax.legend(loc="best")
+    ## ANIMATION of the CARP paths    
+    fig, ax = plt.subplots(figsize=(8,8))
+    ax.set_aspect('equal'); ax.grid(True)
+    ax.plot(ring_x, ring_y, color='0.8')
+    ax.scatter([tgtE],[tgtN], marker='x', s=120, label='Target')
+    
+    path, = ax.plot([], [], lw=1.8, alpha=0.8)
+    dot  = ax.scatter([], [], s=40)
+    text = ax.text(0.02, 0.98, '', transform=ax.transAxes, va='top')
+    
+    cands = []
+    for i, (x, y, z) in enumerate(zip(history_x, history_y, history_z)):
+        miss = scores[i]
+        relN = y[0]; relE = x[0]
+        cands.append((relE, relN, x, y, miss))
+    
+    def init():
+        path.set_data([], [])
+        dot.set_offsets([0,0])
+        text.set_text('')
+        return path, dot, text
+
+    def update(i):
+        relE, relN, x, y, miss = cands[i]
+        print(f"Animating candidate {i+1}/{len(cands)} with miss={miss:.1f} m")
+        path.set_data(x, y)
+        dot.set_offsets([relE, relN])
+        text.set_text(f'candidate {i+1}/{len(cands)}\nmiss={miss:.1f} m')
+        return path, dot, text
+
+    ani = anim.FuncAnimation(fig, update, frames=len(cands), init_func=init, blit=True, interval=120)
+    
+    #ax.legend(loc="best")
+    if save:
+        plt.savefig(os.path.join(config.out_dir, "carp_paths.png"), dpi=400)
+        plt.savefig(os.path.join(config.out_dir, "carp_paths.svg"))
+    
+    return fig, ax, ani
+
+
+# plot the dispersion and ellipse with the region box from our monte carlos
+def plot_dispersion_ellipse(
+    impacts: np.ndarray, config:Config, save:bool=False,
+    filename:str="") -> Tuple[plt.Figure, plt.Axes]:
+    from matplotlib.patches import Ellipse, Rectangle
+    tgtN, tgtE = config.target_NE
+
+    # Ellipse + region box (computed in x=E, y=N space)
+    mean_xy = impacts.mean(axis=0)
+    cov_xy = np.cov(impacts.T)
+    eigvals, eigvecs = np.linalg.eigh(cov_xy)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]; eigvecs = eigvecs[:,order]
+    axes_lengths = 2*CFG.ellipse_nsig*np.sqrt(eigvals)
+    angle_rad = math.atan2(eigvecs[1,0], eigvecs[0,0])
+
+    theta = np.linspace(0, 2*np.pi, 240)
+    ellipse_local = np.vstack([
+        (axes_lengths[0]/2)*np.cos(theta),
+        (axes_lengths[1]/2)*np.sin(theta)
+    ])
+    Rmat = np.array([[np.cos(angle_rad), -np.sin(angle_rad)],
+                     [np.sin(angle_rad),  np.cos(angle_rad)]])
+    ellipse_global = (Rmat @ ellipse_local) + mean_xy.reshape(2,1)
+    xmin, ymin = ellipse_global[0].min(), ellipse_global[1].min()
+    xmax, ymax = ellipse_global[0].max(), ellipse_global[1].max()
+    xmin -= CFG.box_margin_m; ymin -= CFG.box_margin_m
+    xmax += CFG.box_margin_m; ymax += CFG.box_margin_m
+    box_w, box_h = xmax - xmin, ymax - ymin
+    
+    fig , ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.set_aspect('equal', adjustable='box'); ax.grid(True, alpha=0.3)
+    ax.scatter(impacts[:,0], impacts[:,1], s=6, alpha=0.4, label="Impacts")
+    ax.scatter([tgtE],[tgtN], marker='x', s=80, label="Target")
+    ax.add_patch(Ellipse(xy=mean_xy, width=axes_lengths[0], 
+        height=axes_lengths[1],angle=np.degrees(angle_rad), 
+        fill=False, lw=2, label="~95% ellipse"))
+    ax.add_patch(Rectangle((xmin, ymin),
+                           box_w, box_h,
+                           fill=False, lw=2, 
+                           linestyle="--", 
+                           label="A* region box"))
+    ax.axis('equal'); 
+    ax.grid(True)
+    ax.set_xlabel("East [m]"); 
+    ax.set_ylabel("North [m]")
+    ax.set_title(f"Impact dispersion (N={CFG.N_mc})")
+    ax.legend(loc="best")
+    
+    if save:
+        # save as png
+        file_pngname:str = "dispersion_ellipse.png" if filename == "" else filename + ".png"
+        plt.savefig(os.path.join(config.out_dir, file_pngname), dpi=400)
+        plt.savefig(os.path.join(config.out_dir, file_pngname + ".svg"))
+
+    return fig, ax
+
+def make_dispersion_raindrops_animation(updated_wind, updated_std,
+                                        simulate_parafoil_drop,
+                                        carp_NE, CFG, out_path="/mnt/data/dispersion_raindrops.mp4",
+                                        fps=12):
+    """Animates N Monte-Carlo trajectories dropping one-by-one and accumulates the impact cloud."""
+    tgtN, tgtE = CFG.target_NE
+
+    # # Precompute trajectories for smooth animation
+    traj, impacts = [], []
+    for _ in range(CFG.N_mc):
+        def wind_mc(z):
+            muN, muE = updated_wind(z)
+            sN, sE = updated_std(z)
+            return np.random.normal(muN, sN), np.random.normal(muE, sE)
+        X, Y, Z, miss = simulate_parafoil_drop(carp_NE, wind_mc, turb_sigma=CFG.turb_sigma_mps)
+        traj.append((X, Y))
+        impacts.append([X[-1], Y[-1]])  # (x=E, y=N, z)
+    impacts = np.array(impacts)
+
+    # Figure
+    fig, ax = plt.subplots(figsize=(6,6))
+    ax.set_aspect('equal', adjustable='box'); ax.grid(True, alpha=0.3)
+    ax.scatter([tgtE],[tgtN], marker='x', s=120, label='Target')
+    ax.set_xlabel("East [m]"); ax.set_ylabel("North [m]")
+    ax.set_title(f"Monte-Carlo dispersion (N={CFG.N_mc})")
+
+    # Set reasonable bounds from trajectories
+    allX = np.concatenate([t[0] for t in traj])
+    allY = np.concatenate([t[1] for t in traj])
+    mx = max(allX.max(), allY.max()); 
+    mn = min(allX.min(), allY.min())
+    # set the max of the end of the trajectories
+    max_end = max([t[0][-1] for t in traj] + [t[1][-1] for t in traj])
+    pad = 0.1*(max_end - mn + 1e-6)
+    mx = max(mx, max_end)
+    mn = min(mn, max_end)
+    
+    #pad = 0.1*(mx-mn + 1e-6)
+    ax.set_xlim(mn, mx + pad); ax.set_ylim(mn - pad, mx + pad)
+
+    # Artists
+    pts = ax.scatter([], [], s=14, alpha=0.5, label='Impacts')
+    path_line, = ax.plot([], [], lw=0.8, alpha=0.6, color='C0')
+    # legend = ax.legend(loc="best")
+    # legend at upper left
+    legend = ax.legend(loc="upper left")
+
+    def init():
+        pts.set_offsets(np.empty((0,2)))
+        path_line.set_data([], [])
+        return pts, path_line
+
+    def update(i):
+        X, Y = traj[i]
+        path_line.set_data(X, Y)
+        pts.set_offsets(np.array(impacts[:i+1]))
+        return pts, path_line
+
+    ani = anim.FuncAnimation(fig, update, frames=len(traj),
+            init_func=init, blit=True, interval=int(1000/fps))
+    # try:
+    #     ani.save(out_path, dpi=150, fps=fps, codec='h264', bitrate=2000)
+    # except Exception:
+    #     from matplotlib.animation import PillowWriter
+    #     gif_path = out_path.rsplit('.',1)[0] + ".gif"
+    #     ani.save(gif_path, dpi=150, writer=PillowWriter(fps=fps))
+    #     out_path = gif_path
+    # plt.close(fig)
+    return fig, ax, ani
+
 
 # =========================
 # 5) RUN THE PIPELINE
@@ -942,7 +1265,7 @@ def main():
         pins_src = "real"
     else:
         if CFG.sim_loiter_alts_m is None:
-            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 400, CFG.z_release + 200, 50).tolist()
+            CFG.sim_loiter_alts_m = np.arange(CFG.z_release - 400, CFG.z_release + 200, 20).tolist()
 
         wind_for_pins = (truth.wind if (truth is not None and CFG.use_truth_for_pins)
                         else (prior.wind if prior is not None else (lambda z: (0.0, 0.0))))
@@ -998,16 +1321,19 @@ def main():
     #     z_min=CFG.z_min, z_max=CFG.z_max, dz=CFG.dz,
     #     cfg=cfg,
     #     prior=prior,            # or try prior=None
-    #     blend_width_m=0.0       # try 0 to see raw GP; then re-enable if needed
+    #     blend_width_m=20.0       # try 0 to see raw GP; then re-enable if needed
     # )
 
     # CARP using layer wind at release
     wN_layer, wE_layer = updated_wind(CFG.z_release)
     start_time = time.time()
-    carp_NE, carp_err = carp_from_layer_wind(wN_layer, wE_layer)
+    carp_NE, carp_err, candidate_x, candidate_y,candidate_z, scores = carp_from_layer_wind(wN_layer, wE_layer)
+    
     # Deterministic drop with FULL updated profile
-    X_det, Y_det, miss_det = simulate_parafoil_drop(carp_NE, updated_wind, turb_sigma=0.0)
+    X_det, Y_det, Z_det, miss_det = simulate_parafoil_drop(carp_NE, updated_wind, turb_sigma=0.0)
     final_time = time.time()
+    
+    
     print(f"CARP + deterministic drop took {final_time - start_time:.2f} seconds")
     # Monte-Carlo with altitude-dependent uncertainty
     impacts = []
@@ -1017,8 +1343,8 @@ def main():
             muN, muE = updated_wind(z)
             sN, sE = updated_std(z)
             return np.random.normal(muN, sN), np.random.normal(muE, sE)
-        X, Y, _ = simulate_parafoil_drop(carp_NE, wind_mc, turb_sigma=CFG.turb_sigma_mps)
-        impacts.append([X[-1], Y[-1]])  # (x=E, y=N)
+        X, Y, Z, miss = simulate_parafoil_drop(carp_NE, wind_mc, turb_sigma=CFG.turb_sigma_mps)
+        impacts.append([X[-1], Y[-1]])  # (x=E, y=N, z)
     final_time = time.time()
     print(f"CARP + {CFG.N_mc} MC drops took {final_time - start_time:.2f} seconds")
     impacts = np.array(impacts)
@@ -1167,7 +1493,25 @@ def main():
     fig_path = os.path.join(CFG.out_dir, "wind_pipeline_results_same.png")
     plt.savefig(fig_path, dpi=150)
     
-    figures, axs = plot_wind_profile(prior=prior, 
+    fig, ax = plot_dispersion_ellipse(impacts=impacts, 
+                                      config=CFG, 
+                                      save=True,
+                                      filename="dispersion_ellipse")
+
+    fig, ax, _ = plot_wind_prior_only(prior=prior,
+                      config=CFG,
+                      pins=pins,
+                      pins_src=pins_src,
+                      updated_wind=updated_wind,
+                      updated_std=updated_std,
+                      zmin=zmin,
+                      zmax=zmax,
+                      truth=truth,
+                      spacing=300,
+                      save=True,
+                    file_name="figs/wind_profile_prior_only")
+
+    figures, ax = plot_wind_profile(prior=prior,
                       config=CFG,
                       pins=pins,
                       pins_src=pins_src,
@@ -1180,16 +1524,33 @@ def main():
                       save=True,
                       file_name="figs/wind_profile_matching")    
 
+    fig, ax , ani = make_dispersion_raindrops_animation(
+        updated_wind=updated_wind,
+        updated_std=updated_std,
+        simulate_parafoil_drop=simulate_parafoil_drop,
+        carp_NE=carp_NE,
+        CFG=CFG,
+        out_path=os.path.join(CFG.out_dir, "dispersion_raindrops.mp4"),
+        fps=12
+    )
+    # fig, ax, ani = plot_carp_paths(config =CFG,
+    #                           history_x=candidate_x,
+    #                           history_y=candidate_y,
+    #                           history_z=candidate_z,
+    #                           scores=scores,
+    #                           save=True)
+    plt.show()
+
 if __name__ == "__main__":
     plt.close('all')
     csvs: List[str] = find_desired_csvs("Balloon Wind Files", "desc")
     print(f"Found {len(csvs)} candidate prior CSVs:")
     CFG = Config()
-
+    CFG.out_dir = "figs"
     CFG.prior_csv_path = csvs[1] if csvs else CFG.prior_csv_path
     CFG.completely_different = True
     CFG.prior_mode = "csv"
-    CFG.truth_mode: str = "csv"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
+    CFG.truth_mode: str = "biased_from_prior"   # "biased_from_prior" | "csv" | "same_as_prior" | "none"
     CFG.truth_csv_path = csvs[1]
     #print(f"Using prior CSV: {CFG.prior_csv_path}")
     #csv_file = open_csv_by_index(csvs, 0)  # change index to select different file
@@ -1197,4 +1558,3 @@ if __name__ == "__main__":
         # randomize seed for each run
         np.random.seed()
         main()
-        plt.show()
